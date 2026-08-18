@@ -16,22 +16,24 @@ This repo is tooling and scripts only. No model weights are vendored — `setup.
 official GGUF checkpoints directly from Meta's own Hugging Face repo (see
 [Model hosting](#model-hosting) for why we don't mirror them ourselves).
 
-## Quick start
+## Quickstart
+
+### 1. Serve
 
 ```bash
-./setup.sh          # builds llama.cpp with Metal, downloads ~20GB of GGUF checkpoints
-./start-server.sh    # launches llama-server on http://127.0.0.1:8080
-./test.sh            # smoke-tests health, chat, and tool-calling
+./setup.sh                          # one-time: builds llama.cpp with Metal, downloads ~20GB of GGUF checkpoints
+./start-server.sh > server.log 2>&1 &    # launches llama-server on http://127.0.0.1:8080
 ```
 
-Then either:
-- open `http://127.0.0.1:8080` for the built-in chat web UI, or
-- point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`.
+Wait for `llama_server: model loaded` in `server.log` — a cold load (nothing in the OS page
+cache yet) takes ~30-45s, a warm one closer to ~3s. Confirm it's up:
 
-### Corporate proxy note
+```bash
+curl http://127.0.0.1:8080/health   # {"status":"ok"}
+```
 
-If Hugging Face downloads need to go through a corporate TLS-inspecting proxy, export these
-before running `setup.sh`:
+**Corporate proxy note**: if Hugging Face downloads need to go through a corporate
+TLS-inspecting proxy, export these before running `setup.sh`:
 
 ```bash
 export REQUESTS_CA_BUNDLE=/path/to/your/ca-bundle.crt
@@ -42,6 +44,53 @@ export SSL_CERT_FILE=/path/to/your/ca-bundle.crt
 its own HTTP client that ignores the variables above and will silently corrupt downloads
 through an inspecting proxy (`IncompleteBody` errors). Disabling it forces the classic
 `requests`-based downloader, which respects your CA bundle.
+
+### 2. The front end
+
+Open `http://127.0.0.1:8080` in a browser. This is llama.cpp's own bundled, first-party chat
+web UI (SvelteKit, lives in `tools/server` upstream) — not a separate project, not something
+this repo adds. It ships a full chat interface plus a **built-in MCP client**: under its
+settings you can point it directly at MCP tool servers and chat with tool use enabled, no
+external agent needed. That MCP wiring is entirely browser-side JavaScript talking to this
+same OpenAI-compatible API underneath — see [Tool-calling and MCP](#tool-calling-and-mcp) for
+exactly how that connects to the backend.
+
+Prefer code? Point any OpenAI SDK at the base URL instead:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
+resp = client.chat.completions.create(
+    model="muse-glimmer",  # ignored — only one model is ever loaded
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+### 3. Tool use
+
+```bash
+./test.sh   # health check, a plain chat completion, and a tool-calling request
+```
+
+The tool-calling request in `test.sh` sends a standard OpenAI-style `tools` array; the
+response comes back with a standard `tool_calls` array — even though the model itself speaks
+a custom XML format internally. llama.cpp detects this model from its embedded chat template
+and compiles a per-request grammar that both *constrains* generation to valid tool-call syntax
+and *parses* it back into that structured JSON — no flags, no separate parser to configure.
+Full mechanism (worth reading if you're debugging a malformed tool call, or onboarding a
+different model that needs its own handler) is in
+[Tool-calling and MCP](#tool-calling-and-mcp).
+
+### 4. Teardown
+
+```bash
+pkill -f "llama.cpp/build/bin/llama-server"
+```
+
+If you're tearing down *because* a request seemed to hang, don't bother debugging flags first —
+just kill and restart with `./start-server.sh`. See
+[Troubleshooting](#troubleshooting): a cancelled client request can leave the GPU queue
+contended enough to stall the next one for 60-90s+, and a clean restart has reliably fixed it.
 
 ## What's actually running
 
@@ -102,16 +151,36 @@ doesn't bite either way. If that changes to serving multiple concurrent users, r
 
 ## Tool-calling and MCP
 
-Muse-Glimmer natively emits a custom XML tool-call format (ATEM-style tags), not OpenAI JSON —
-but llama.cpp's embedded Jinja chat template (baked into the GGUF) translates it automatically.
-No extra flags needed; confirmed working via `test.sh`, producing standard
-`"tool_calls": [{"function": {...}}]` in the API response.
+Muse-Glimmer natively emits a custom XML tool-call format (ATEM-style tags: `<atem:function_calls>`,
+`<atem:invoke name="...">`, `<atem:parameter name="...">`), not OpenAI JSON — but llama.cpp
+translates it automatically. No extra flags needed; confirmed working via `test.sh`, producing
+standard `"tool_calls": [{"function": {...}}]` in the API response. The actual mechanism, read
+directly from `common/chat.cpp` in the exact build this repo runs:
+
+- **Detection has no flag** (unlike vLLM's `--tool-call-parser`). llama.cpp scans the model's own
+  embedded Jinja template source for `<atem:function_calls>` + `<|eom|>` and routes to a
+  dedicated, hand-written `common_chat_params_init_muse_glimmer()` handler built for this model.
+- **The Jinja template still renders the prompt** — turning your `messages`/`tools` JSON into
+  the literal ATEM/channel-syntax text the model was trained on.
+- **A per-request PEG grammar does the rest, in both directions.** For every request with a
+  `tools` array, llama.cpp compiles a parsing grammar — one rule per tool, generated straight
+  from that tool's JSON schema — and uses it twice: as a **hard constraint during sampling**
+  (the model literally cannot emit invalid ATEM syntax or an unknown tool/argument shape when
+  tools are offered), and again to **parse** the generated text back into `tool_calls[].function.
+  {name,arguments}`, cleanly separated from the reasoning channel (`to=self`) and the
+  user-facing channel (`to=user`). This is why the tool call in `test.sh` comes back
+  well-formed every time, not just usually.
 
 **MCP specifically**: llama.cpp's MCP client lives in the *browser* web UI (merged upstream
 ~March 2026), not the C++ backend — the server only adds `--webui-mcp-proxy`, a CORS proxy for
-that browser-side client. To drive this from MCP tool servers via the API instead, point an
-MCP-aware agent (Claude Code, opencode, etc.) at `http://127.0.0.1:8080/v1` and let the agent
-handle the MCP↔tool-call translation against the already-working tool-calling endpoint above.
+that browser-side client. Everything above is identical regardless of who's calling it — the
+backend has no concept of MCP at all, only the generic OpenAI `tools`/`tool_calls` schema. The
+browser UI's MCP client does its own MCP↔JSON translation client-side (query the MCP server's
+tools, send them as the same `tools` array shown above, execute whatever comes back in
+`tool_calls` against the real MCP server, feed the result back as a `role: "tool"` message) —
+from the server's point of view, that's indistinguishable from a raw `curl` call. To drive this
+from an external agent instead of the browser, point an MCP-aware client (Claude Code, opencode,
+etc.) at `http://127.0.0.1:8080/v1` and let it do the same translation.
 There's also a built-in `--tools` flag (`read_file`, `grep_search`, `exec_shell_command`, …) for
 testing tool-use without any MCP server at all — server-implemented, experimental/untrusted-only.
 
