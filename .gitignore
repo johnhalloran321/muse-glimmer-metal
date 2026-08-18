@@ -1,0 +1,16 @@
+# Rebuilt/redownloaded by setup.sh — not tracked
+llama.cpp/
+models/
+
+# Runtime artifacts
+slot-cache/
+server.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+.DS_Store

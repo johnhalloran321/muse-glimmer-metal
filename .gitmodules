@@ -1,0 +1,3 @@
+[submodule "mlx-dspark"]
+	path = mlx-dspark
+	url = https://github.com/johnhalloran321/mlx-dspark
