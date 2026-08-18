@@ -1,0 +1,82 @@
+# Agent instructions for this repo
+
+Local inference setup for Meta's Muse-Glimmer-30B on Apple Silicon via llama.cpp + Metal.
+Scripts and docs only — no model weights are vendored (see "Model hosting" in README.md for why).
+
+## Setup / run / test
+
+```bash
+./setup.sh          # one-time: builds llama.cpp, downloads ~20GB of GGUF checkpoints
+./start-server.sh    # launches llama-server on :8080 with the validated flags
+./test.sh            # health + chat + tool-calling smoke tests
+```
+
+Don't hand-invent a different `llama-server` invocation when asked to run or test this — use
+`start-server.sh`. If you need different flags for an experiment, pass them as extra args
+(`./start-server.sh --some-flag value`) rather than duplicating the base command elsewhere;
+the base flags encode validated decisions (quant choice, KV cache type, context size) that
+took real measurement to arrive at, documented in README.md.
+
+## Hard constraints — don't relitigate these without new evidence
+
+- **Target machine has no sudo/admin.** Don't add setup steps that assume `sudo sysctl
+  iogpu.wired_limit_mb` was run — it's optional and `setup.sh` only prints it as a suggestion.
+  Everything must work under macOS's *default* Metal memory ceiling (~75% of physical RAM).
+- **DFlash speculative decoding is deliberately off by default.** Measured slower on this
+  hardware (15.4 → 12.8 tok/s) despite the vendor's advertised 1.5-1.8x speedup on M4/M5 Max.
+  Don't re-enable it in `start-server.sh` without re-measuring on the actual target machine first.
+- **Quant choice (Meta's K-Quant-17GB over Unsloth's UD-Q4_K_XL) is a measured tradeoff, not a
+  default.** Meta's quant is faster (~40%) and gets better speculative-decoding drafter
+  acceptance; Unsloth's scores marginally better on task quality. If asked to switch, re-check
+  the current numbers rather than assuming last measurement still holds — community quants get
+  updated.
+- **Don't upload or mirror the GGUF checkpoints anywhere (HF, S3, this repo).** They're Meta's
+  unmodified official release; we haven't changed the weights. `setup.sh` pulls directly from
+  `meta-models/Muse-Glimmer-30B-GGUF`.
+- **`HF_HUB_DISABLE_XET=1` in `setup.sh` is load-bearing, not incidental.** Hugging Face's Xet
+  fast-transfer backend has its own HTTP client that ignores `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE`
+  and silently corrupts downloads through a TLS-inspecting corporate proxy. Don't remove it to
+  "simplify" the download command.
+
+## Known operational gotcha
+
+A request cancelled client-side (timeout, Ctrl-C) can leave the single Metal GPU queue contended
+enough that the *next* request stalls for 60-90s+ instead of its normal cost. If a request hangs,
+restart `start-server.sh` before assuming a flag or code change is at fault — this reproduced
+during initial testing and a clean restart fixed it every time.
+
+## MCP / tool-calling
+
+Muse-Glimmer emits a custom XML tool-call format; llama.cpp's embedded Jinja template (baked
+into the GGUF) already translates it into standard OpenAI-style `tool_calls` — confirmed working,
+no extra parser flags needed. llama.cpp's MCP client lives in the browser web UI, not the C++
+backend (the backend only adds `--webui-mcp-proxy`, a CORS proxy). To drive this via MCP from the
+API, point an MCP-aware agent at `http://127.0.0.1:8080/v1` and let *it* do the MCP↔tool-call
+translation — don't try to make the backend itself MCP-native, that's not how llama.cpp built it.
+
+## mlx-dspark submodule
+
+`mlx-dspark/` is a git submodule pointing at a fork (`johnhalloran321/mlx-dspark`), not upstream
+(`ARahim3/mlx-dspark`) — this is deliberate, so local edits are pushable. Not yet wired up (no
+venv/pip install done). Two intended directions, in priority order:
+
+1. **Bonsai-27B (ternary)** — new capability, small footprint (~15GB), not duplicated by anything
+   else in this repo. This is the priority.
+2. **Muse-Glimmer via MLX+DSpark** — lower priority, optional side-experiment. The registry's
+   honest 4-bit number (~1.57-1.94x) is well short of the advertised 3.27x (which needs the
+   8-bit/~40GB target this machine can't fit), and peak RAM (~26GB target+drafter+cache) is
+   tighter than the ~18-20GB the current GGUF setup already runs comfortably. Don't present this
+   as a required migration — it's an experiment to run only if there's time for it.
+
+When editing inside `mlx-dspark/`, commit and push from *within* that submodule directory against
+its own remote, then update the gitlink in this parent repo (`git add mlx-dspark`) — don't try to
+commit its file changes directly from the parent repo.
+
+## Directory layout
+
+```
+setup.sh, start-server.sh, test.sh   # entry points — see above
+README.md                             # full rationale, benchmarks, troubleshooting
+mlx-dspark/                           # submodule, fork, not yet wired up
+llama.cpp/, models/                   # gitignored, regenerated by setup.sh — never commit these
+```
