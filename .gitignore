@@ -14,6 +14,8 @@ __pycache__/
 venv/
 
 .DS_Store
+.vscode/
+.idea/
 
 # Personal, not shared
 .claude/settings.local.json

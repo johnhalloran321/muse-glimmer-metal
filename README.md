@@ -1,5 +1,12 @@
 # Muse-Glimmer-30B on a 32GB Apple Silicon Mac
 
+**Meta's 30B dense vision + agentic-tool-use model, running comfortably on a Mac that isn't
+supposed to fit it — no admin access, no cloud, no compromises on tool-calling.**
+
+![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-111111?logo=apple&logoColor=white)
+![Engine](https://img.shields.io/badge/engine-llama.cpp%20%2B%20Metal-2563eb)
+![RAM](https://img.shields.io/badge/RAM-32GB%2C%20no%20sudo-2e7d32)
+
 Runs Meta's [Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) (dense
 30B, text+image, agentic tool-use) locally on Apple Silicon via
 [llama.cpp](https://github.com/ggml-org/llama.cpp) + Metal — validated on a 32GB M2 MacBook
@@ -66,6 +73,32 @@ through an inspecting proxy (`IncompleteBody` errors). Disabling it forces the c
   [antirez/ds4](https://github.com/antirez/ds4) hand-built for DeepSeek, available in stock
   llama.cpp: `POST /slots/{id}?action=save|restore` saves/restores warmed KV state across
   restarts instead of re-prefilling every session.
+
+## Batching / serving architecture
+
+**Continuous batching isn't something llama.cpp lacks — it's on by default and already active
+here.** Every server log line on load shows `n_slots = 4`: that's 4-way continuous (dynamic)
+batching, a mature, default-enabled `llama-server` feature (2026 refinements added decode-maximal
+scheduling and chunked prefill on top). We didn't configure this — it was already running before
+either of us touched a batching flag.
+
+Checked the "just use vLLM/MLX-serve instead" alternatives concretely rather than assume they're
+better:
+
+- [`vllm-metal`](https://github.com/vllm-project/vllm-metal) — a real, fast-improving community
+  plugin bringing vLLM's engine to Apple Silicon via MLX. But its supported-models list does
+  **not** include Muse-Glimmer-30B, or any custom VLM architecture like it — only Qwen3-VL and
+  PaddleOCR-VL, both still experimental. Not usable for this model today, independent of the
+  batching question.
+- **`mlx-lm`'s server** does have confirmed continuous batching (Apple's own WWDC26 session
+  covers it directly). But that's the text-only package — Muse-Glimmer's vision path needs
+  `mlx-vlm` specifically, which per mlx-dspark's own README needed a custom hidden-state-tap
+  workaround just to run at all. Whether `mlx-vlm`'s serving stack has the same batching
+  maturity as `mlx-lm`'s is genuinely unconfirmed here — not verified true or false.
+
+For this repo's actual use case (single local user, agentic dev/testing) the batching question
+doesn't bite either way. If that changes to serving multiple concurrent users, re-check
+`vllm-metal`'s model coverage again before assuming it's still unsupported — it's moving fast.
 
 ## Tool-calling and MCP
 
